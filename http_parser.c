@@ -1072,8 +1072,16 @@ reexecute:
       {
         switch (ch) {
           case ' ':
-            UPDATE_STATE(s_req_http_start);
-            CALLBACK_DATA(url);
+            if (*(p+1) == 'H') {
+               UPDATE_STATE(s_req_http_start);
+               CALLBACK_DATA(url);
+            } else {
+               UPDATE_STATE(parse_url_char(CURRENT_STATE(), '+'));
+               if (UNLIKELY(CURRENT_STATE() == s_dead)) {
+                   SET_ERRNO(HPE_INVALID_URL);
+                   goto error;
+               }
+            }
             break;
           case CR:
           case LF:
