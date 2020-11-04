@@ -381,10 +381,7 @@ enum header_states
   , h_transfer_encoding
   , h_upgrade
 
-  , h_matching_transfer_encoding_token_start
   , h_matching_transfer_encoding_chunked
-  , h_matching_transfer_encoding_token
-
   , h_matching_connection_token_start
   , h_matching_connection_keep_alive
   , h_matching_connection_close
@@ -653,8 +650,6 @@ size_t http_parser_execute (http_parser *parser,
   const char *status_mark = 0;
   enum state p_state = (enum state) parser->state;
   const unsigned int lenient = parser->lenient_http_headers;
-  const unsigned int allow_chunked_length = parser->allow_chunked_length;
-
   uint32_t nread = parser->nread;
 
   /* We're in an error state. Don't bother doing anything. */
@@ -733,7 +728,6 @@ reexecute:
         if (ch == CR || ch == LF)
           break;
         parser->flags = 0;
-        parser->uses_transfer_encoding = 0;
         parser->content_length = ULLONG_MAX;
 
         if (ch == 'H') {
@@ -771,7 +765,6 @@ reexecute:
         if (ch == CR || ch == LF)
           break;
         parser->flags = 0;
-        parser->uses_transfer_encoding = 0;
         parser->content_length = ULLONG_MAX;
 
         if (ch == 'H') {
@@ -929,7 +922,6 @@ reexecute:
         if (ch == CR || ch == LF)
           break;
         parser->flags = 0;
-        parser->uses_transfer_encoding = 0;
         parser->content_length = ULLONG_MAX;
 
         if (UNLIKELY(!IS_ALPHA(ch))) {
@@ -1072,8 +1064,16 @@ reexecute:
       {
         switch (ch) {
           case ' ':
-            UPDATE_STATE(s_req_http_start);
-            CALLBACK_DATA(url);
+            if (*(p+1) == 'H') {
+               UPDATE_STATE(s_req_http_start);
+               CALLBACK_DATA(url);
+            } else {
+               UPDATE_STATE(parse_url_char(CURRENT_STATE(), '+'));
+               if (UNLIKELY(CURRENT_STATE() == s_dead)) {
+                   SET_ERRNO(HPE_INVALID_URL);
+                   goto error;
+               }
+            }
             break;
           case CR:
           case LF:
@@ -1265,9 +1265,9 @@ reexecute:
 
           switch (parser->header_state) {
             case h_general: {
-              size_t left = data + len - p;
-              const char* pe = p + MIN(left, max_header_size);
-              while (p+1 < pe && TOKEN(p[1])) {
+              size_t limit = data + len - p;
+              limit = MIN(limit, max_header_size);
+              while (p+1 < data + limit && TOKEN(p[1])) {
                 p++;
               }
               break;
@@ -1343,7 +1343,6 @@ reexecute:
                 parser->header_state = h_general;
               } else if (parser->index == sizeof(TRANSFER_ENCODING)-2) {
                 parser->header_state = h_transfer_encoding;
-                parser->uses_transfer_encoding = 1;
               }
               break;
 
@@ -1425,12 +1424,8 @@ reexecute:
             if ('c' == c) {
               parser->header_state = h_matching_transfer_encoding_chunked;
             } else {
-              parser->header_state = h_matching_transfer_encoding_token;
+              parser->header_state = h_general;
             }
-            break;
-
-          /* Multi-value `Transfer-Encoding` header */
-          case h_matching_transfer_encoding_token_start:
             break;
 
           case h_content_length:
@@ -1509,25 +1504,28 @@ reexecute:
 
           switch (h_state) {
             case h_general:
-              {
-                size_t left = data + len - p;
-                const char* pe = p + MIN(left, max_header_size);
+            {
+              const char* p_cr;
+              const char* p_lf;
+              size_t limit = data + len - p;
 
-                for (; p != pe; p++) {
-                  ch = *p;
-                  if (ch == CR || ch == LF) {
-                    --p;
-                    break;
-                  }
-                  if (!lenient && !IS_HEADER_CHAR(ch)) {
-                    SET_ERRNO(HPE_INVALID_HEADER_TOKEN);
-                    goto error;
-                  }
-                }
-                if (p == data + len)
-                  --p;
-                break;
+              limit = MIN(limit, max_header_size);
+
+              p_cr = (const char*) memchr(p, CR, limit);
+              p_lf = (const char*) memchr(p, LF, limit);
+              if (p_cr != NULL) {
+                if (p_lf != NULL && p_cr >= p_lf)
+                  p = p_lf;
+                else
+                  p = p_cr;
+              } else if (UNLIKELY(p_lf != NULL)) {
+                p = p_lf;
+              } else {
+                p = data + len;
               }
+              --p;
+              break;
+            }
 
             case h_connection:
             case h_transfer_encoding:
@@ -1576,38 +1574,13 @@ reexecute:
               goto error;
 
             /* Transfer-Encoding: chunked */
-            case h_matching_transfer_encoding_token_start:
-              /* looking for 'Transfer-Encoding: chunked' */
-              if ('c' == c) {
-                h_state = h_matching_transfer_encoding_chunked;
-              } else if (STRICT_TOKEN(c)) {
-                /* TODO(indutny): similar code below does this, but why?
-                 * At the very least it seems to be inconsistent given that
-                 * h_matching_transfer_encoding_token does not check for
-                 * `STRICT_TOKEN`
-                 */
-                h_state = h_matching_transfer_encoding_token;
-              } else if (c == ' ' || c == '\t') {
-                /* Skip lws */
-              } else {
-                h_state = h_general;
-              }
-              break;
-
             case h_matching_transfer_encoding_chunked:
               parser->index++;
               if (parser->index > sizeof(CHUNKED)-1
                   || c != CHUNKED[parser->index]) {
-                h_state = h_matching_transfer_encoding_token;
+                h_state = h_general;
               } else if (parser->index == sizeof(CHUNKED)-2) {
                 h_state = h_transfer_encoding_chunked;
-              }
-              break;
-
-            case h_matching_transfer_encoding_token:
-              if (ch == ',') {
-                h_state = h_matching_transfer_encoding_token_start;
-                parser->index = 0;
               }
               break;
 
@@ -1669,7 +1642,7 @@ reexecute:
               break;
 
             case h_transfer_encoding_chunked:
-              if (ch != ' ') h_state = h_matching_transfer_encoding_token;
+              if (ch != ' ') h_state = h_general;
               break;
 
             case h_connection_keep_alive:
@@ -1803,22 +1776,12 @@ reexecute:
           REEXECUTE();
         }
 
-        /* Cannot use transfer-encoding and a content-length header together
-           per the HTTP specification. (RFC 7230 Section 3.3.3) */
-        if ((parser->uses_transfer_encoding == 1) &&
+        /* Cannot use chunked encoding and a content-length header together
+           per the HTTP specification. */
+        if ((parser->flags & F_CHUNKED) &&
             (parser->flags & F_CONTENTLENGTH)) {
-          /* Allow it for lenient parsing as long as `Transfer-Encoding` is
-           * not `chunked` or allow_length_with_encoding is set
-           */
-          if (parser->flags & F_CHUNKED) {
-            if (!allow_chunked_length) {
-              SET_ERRNO(HPE_UNEXPECTED_CONTENT_LENGTH);
-              goto error;
-            }
-          } else if (!lenient) {
-            SET_ERRNO(HPE_UNEXPECTED_CONTENT_LENGTH);
-            goto error;
-          }
+          SET_ERRNO(HPE_UNEXPECTED_CONTENT_LENGTH);
+          goto error;
         }
 
         UPDATE_STATE(s_headers_done);
@@ -1893,31 +1856,8 @@ reexecute:
           UPDATE_STATE(NEW_MESSAGE());
           CALLBACK_NOTIFY(message_complete);
         } else if (parser->flags & F_CHUNKED) {
-          /* chunked encoding - ignore Content-Length header,
-           * prepare for a chunk */
+          /* chunked encoding - ignore Content-Length header */
           UPDATE_STATE(s_chunk_size_start);
-        } else if (parser->uses_transfer_encoding == 1) {
-          if (parser->type == HTTP_REQUEST && !lenient) {
-            /* RFC 7230 3.3.3 */
-
-            /* If a Transfer-Encoding header field
-             * is present in a request and the chunked transfer coding is not
-             * the final encoding, the message body length cannot be determined
-             * reliably; the server MUST respond with the 400 (Bad Request)
-             * status code and then close the connection.
-             */
-            SET_ERRNO(HPE_INVALID_TRANSFER_ENCODING);
-            RETURN(p - data); /* Error */
-          } else {
-            /* RFC 7230 3.3.3 */
-
-            /* If a Transfer-Encoding header field is present in a response and
-             * the chunked transfer coding is not the final encoding, the
-             * message body length is determined by reading the connection until
-             * it is closed by the server.
-             */
-            UPDATE_STATE(s_body_identity_eof);
-          }
         } else {
           if (parser->content_length == 0) {
             /* Content-Length header given but zero: Content-Length: 0\r\n */
@@ -2169,12 +2109,6 @@ http_message_needs_eof (const http_parser *parser)
       parser->status_code == 304 ||     /* Not Modified */
       parser->flags & F_SKIPBODY) {     /* response to a HEAD request */
     return 0;
-  }
-
-  /* RFC 7230 3.3.3, see `s_headers_almost_done` */
-  if ((parser->uses_transfer_encoding == 1) &&
-      (parser->flags & F_CHUNKED) == 0) {
-    return 1;
   }
 
   if ((parser->flags & F_CHUNKED) || parser->content_length != ULLONG_MAX) {
@@ -2524,7 +2458,7 @@ http_parser_parse_url(const char *buf, size_t buflen, int is_connect,
     end = buf + off + len;
 
     /* NOTE: The characters are already validated and are in the [0-9] range */
-    assert((size_t) (off + len) <= buflen && "Port number overflow");
+    assert(off + len <= buflen && "Port number overflow");
     v = 0;
     for (p = buf + off; p < end; p++) {
       v *= 10;
